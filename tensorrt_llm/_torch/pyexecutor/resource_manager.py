@@ -561,6 +561,10 @@ class KVCacheManager(BaseResourceManager):
             pin_memory=prefer_pinned(),
             device='cpu')
 
+        logger.info(
+            f"  self.host_kv_cache_block_offsets: {self.host_kv_cache_block_offsets.shape}, {self.host_kv_cache_block_offsets.element_size() * self.host_kv_cache_block_offsets.numel() / (1024**2):.2f} MB"
+        )
+
     def probe_prefix_match_length(self, input_tokens, lora_task_id=None):
         """Probe the KV cache radix tree for prefix match length.
 
@@ -1578,10 +1582,38 @@ class KVCacheManager(BaseResourceManager):
                                            request_ids[num_context:],
                                            beam_width, num_context)
 
+        # Under confidential compute, pageable H2D copies <2MB stay async but
+        # larger ones synchronize on the host (encryption staging on the
+        # calling thread). Split any per-pool transfer that exceeds 2MB into a
+        # single 2MB cudaMemcpyAsync followed by 64KB cudaMemcpyAsyncs for the
+        # tail so every chunk stays on the async path.
+        _PRIMARY_CHUNK_BYTES = 2 * 1024 * 1024
+        _TAIL_CHUNK_BYTES = 64 * 1024
         for pool_idx in range(self.host_kv_cache_block_offsets.shape[0]):
-            dst_tensor[pool_idx, :num_seqs].copy_(
-                self.host_kv_cache_block_offsets[pool_idx, :num_seqs],
-                non_blocking=True)
+            src = self.host_kv_cache_block_offsets[pool_idx, :num_seqs]
+            dst = dst_tensor[pool_idx, :num_seqs]
+            assert src.is_contiguous() and dst.is_contiguous()
+            total_bytes = src.numel() * src.element_size()
+            if total_bytes <= _PRIMARY_CHUNK_BYTES:
+                dst.copy_(src, non_blocking=True)
+                continue
+            elem_size = src.element_size()
+            primary_elems = max(1, _PRIMARY_CHUNK_BYTES // elem_size)
+            tail_elems = max(1, _TAIL_CHUNK_BYTES // elem_size)
+            src_flat = src.reshape(-1)
+            dst_flat = dst.reshape(-1)
+            total_elems = src_flat.numel()
+            logger.info_once(
+                f'  64KB copy is triggered. {num_seqs=}, {total_elems=}, {primary_elems=}, {tail_elems=}', key='copy_batch_block_offsets'
+            )
+            dst_flat[:primary_elems].copy_(src_flat[:primary_elems],
+                                           non_blocking=True)
+            offset = primary_elems
+            while offset < total_elems:
+                end = min(offset + tail_elems, total_elems)
+                dst_flat[offset:end].copy_(src_flat[offset:end],
+                                           non_blocking=True)
+                offset = end
 
     def reset_reuse_state(self):
         """Reset the reuse state of the KV cache manager."""
