@@ -1582,11 +1582,10 @@ class KVCacheManager(BaseResourceManager):
                                            request_ids[num_context:],
                                            beam_width, num_context)
 
-        # Under confidential compute, pageable H2D copies <2MB stay async but
-        # larger ones synchronize on the host (encryption staging on the
-        # calling thread). Split any per-pool transfer that exceeds 2MB into a
-        # single 2MB cudaMemcpyAsync followed by 64KB cudaMemcpyAsyncs for the
-        # tail so every chunk stays on the async path.
+        # pageable H2D copies <2MB stay async but larger ones synchronize
+        # on the host. Split any per-pool transfer that exceeds 2MB into a
+        # single 2MB cudaMemcpyAsync followed by 64KB cudaMemcpyAsyncs for
+        # the tail so every chunk stays async.
         _PRIMARY_CHUNK_BYTES = 2 * 1024 * 1024
         _TAIL_CHUNK_BYTES = 64 * 1024
         for pool_idx in range(self.host_kv_cache_block_offsets.shape[0]):
@@ -1594,7 +1593,7 @@ class KVCacheManager(BaseResourceManager):
             dst = dst_tensor[pool_idx, :num_seqs]
             assert src.is_contiguous() and dst.is_contiguous()
             total_bytes = src.numel() * src.element_size()
-            if total_bytes <= _PRIMARY_CHUNK_BYTES:
+            if total_bytes <= _PRIMARY_CHUNK_BYTES or src.is_pinned():
                 dst.copy_(src, non_blocking=True)
                 continue
             elem_size = src.element_size()
@@ -1603,9 +1602,6 @@ class KVCacheManager(BaseResourceManager):
             src_flat = src.reshape(-1)
             dst_flat = dst.reshape(-1)
             total_elems = src_flat.numel()
-            logger.info_once(
-                f'  64KB copy is triggered. {num_seqs=}, {total_elems=}, {primary_elems=}, {tail_elems=}', key='copy_batch_block_offsets'
-            )
             dst_flat[:primary_elems].copy_(src_flat[:primary_elems],
                                            non_blocking=True)
             offset = primary_elems
